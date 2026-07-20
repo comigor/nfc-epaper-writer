@@ -13,7 +13,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.cardview.widget.CardView
-import com.askjeffreyliu.floydsteinbergdithering.Utils
 import com.canhub.cropper.CropImage
 import com.canhub.cropper.CropImageView
 import com.vansuita.pickimage.bean.PickResult
@@ -133,7 +132,7 @@ class MainActivity : AppCompatActivity(), IPickResult {
         var bitmap: Bitmap? = null
         if (resultCode == Activity.RESULT_OK) {
             bitmap = result?.getBitmap(this)
-            if (bitmap != null) bitmap = Utils().floydSteinbergDitheringBWR(bitmap)
+            if (bitmap != null) bitmap = EpaperDithering.floydSteinbergBwr(bitmap)
             if (bitmap == null) error = "result not available"
         } else if (resultCode == CropImage.CROP_IMAGE_ACTIVITY_RESULT_ERROR_CODE) {
             error = result!!.error.toString()

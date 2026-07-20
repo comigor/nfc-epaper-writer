@@ -1,19 +1,13 @@
 package com.joshuatz.nfceinkwriter
 
-import android.app.PendingIntent
-import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.nfc.NdefMessage
 import android.nfc.NfcAdapter
 import android.nfc.Tag
+import android.nfc.tech.IsoDep
 import android.nfc.tech.NfcA
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.os.PatternMatcher
 import android.os.SystemClock
 import android.util.Log
 import android.widget.ImageView
@@ -21,65 +15,41 @@ import android.widget.ProgressBar
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import waveshare.feng.nfctag.activity.WaveShareHandler
 import waveshare.feng.nfctag.activity.a
 import java.io.IOException
-import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicBoolean
 
-class NfcFlasher : AppCompatActivity() {
-    private var mIsFlashing = false
-        get() = field
-        set(isFlashing) {
-            field = isFlashing
-            // Hide or show flashing UI
-            this.mWhileFlashingArea?.visibility = if (isFlashing) android.view.View.VISIBLE else android.view.View.GONE
-            this.mWhileFlashingArea?.requestLayout()
-            // Regardless of state change, progress should be reset to zero
-            this.mProgressVal = 0
-        }
+class NfcFlasher : AppCompatActivity(), NfcAdapter.ReaderCallback {
+    companion object {
+        private const val TAG = "NfcFlasher"
+        
+        private const val READER_FLAGS = NfcAdapter.FLAG_READER_NFC_A or 
+                                         NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK or
+                                         NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS
+        
+        private const val PRESENCE_CHECK_DELAY_MS = 30000
+    }
+    
+    private val mIsFlashing = AtomicBoolean(false)
+    
     private var mNfcAdapter: NfcAdapter? = null
-    private var mPendingIntent: PendingIntent? = null
-    private var mNfcTechList = arrayOf(arrayOf(NfcA::class.java.name))
-    private var mNfcIntentFilters: Array<IntentFilter>? = null
-    private var mNfcCheckHandler: Handler? = null
-    private val mNfcCheckIntervalMs = 250L
-    private val mProgressCheckInterval = 50L
     private var mProgressBar: ProgressBar? = null
-    private var mProgressVal: Int = 0
     private var mBitmap: Bitmap? = null
     private var mWhileFlashingArea: ConstraintLayout? = null
     private var mImgFilePath: String? = null
     private var mImgFileUri: Uri? = null
 
-    // Note: Use of object expression / anon class is so `this` can be used
-    // for reference to runnable (which would normally be off-limits)
-    private val mNfcCheckCallback: Runnable = object: Runnable {
-        override fun run() {
-            checkNfcAndAttemptRecover()
-            // Loop!
-            mNfcCheckHandler?.postDelayed(this, mNfcCheckIntervalMs)
-        }
-    }
-
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         if (mImgFileUri != null) {
-            outState.putString("serializedGeneratedImgUri",mImgFileUri.toString())
+            outState.putString("serializedGeneratedImgUri", mImgFileUri.toString())
         }
     }
 
-    // @TODO - change intent to just pass raw bytearr? Cleanup path usage?
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_nfc_flasher)
 
-        /**
-         * Saved bitmap handling
-         */
         val savedUriStr = savedInstanceState?.getString("serializedGeneratedImgUri")
         if (savedUriStr != null) {
             mImgFileUri = Uri.parse(savedUriStr)
@@ -87,13 +57,11 @@ class NfcFlasher : AppCompatActivity() {
             val intentExtras = intent.extras
             mImgFilePath = intentExtras?.getString(IntentKeys.GeneratedImgPath)
             if (mImgFilePath != null) {
-                // @TODO - handle exceptions, navigate back to prev activity
                 val fileRef = getFileStreamPath(mImgFilePath)
                 mImgFileUri = Uri.fromFile(fileRef)
             }
         }
         if (mImgFileUri == null) {
-            // Fallback to last generated image
             val fileRef = getFileStreamPath(GeneratedImageFilename)
             mImgFileUri = Uri.fromFile(fileRef)
         }
@@ -106,261 +74,178 @@ class NfcFlasher : AppCompatActivity() {
             this.mBitmap = BitmapFactory.decodeFile(mImgFileUri!!.path, bmOptions)
         }
 
-        /**
-         * Actual flasher stuff
-         */
-
-        mWhileFlashingArea  = findViewById(R.id.whileFlashingArea)
+        mWhileFlashingArea = findViewById(R.id.whileFlashingArea)
         mProgressBar = findViewById(R.id.nfcFlashProgressbar)
 
-        val originatingIntent = intent
-
-        // Set up intent and intent filters for NFC / NDEF scanning
-        // This is part of the setup for foreground dispatch system
-        val nfcIntent = Intent(this, javaClass).apply {
-            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
-        this.mPendingIntent = PendingIntent.getActivity(this, 0, intent, 0)
-        // Set up the filters
-        var ndefIntentFilter: IntentFilter = IntentFilter(NfcAdapter.ACTION_NDEF_DISCOVERED)
-        try {
-            // android:host
-            ndefIntentFilter.addDataAuthority("ext", null)
-
-            // android:pathPattern
-            // allow all data paths - see notes below
-            ndefIntentFilter.addDataPath(".*", PatternMatcher.PATTERN_SIMPLE_GLOB)
-            // NONE of the below work, although at least one or more should
-            // I think because the payload isn't getting extracted out into the intent by Android
-            // Debugging shows mData.path = null, which makes no sense (it definitely is not, and if
-            // I don't intercept AAR, Android definitely tries to open the corresponding app...
-            //ndefIntentFilter.addDataPath("waveshare.feng.nfctag.*", PatternMatcher.PATTERN_SIMPLE_GLOB);
-            //ndefIntentFilter.addDataPath(".*waveshare\\.feng\\.nfctag.*", PatternMatcher.PATTERN_SIMPLE_GLOB);
-            //ndefIntentFilter.addDataPath("waveshare.feng.nfctag", PatternMatcher.PATTERN_LITERAL);
-            //ndefIntentFilter.addDataPath("waveshare\\.feng\\.nfctag", PatternMatcher.PATTERN_LITERAL);
-
-            // android:scheme
-            ndefIntentFilter.addDataScheme("vnd.android.nfc")
-        } catch (e: IntentFilter.MalformedMimeTypeException) {
-            Log.e("mimeTypeException", "Invalid / Malformed mimeType")
-        }
-        mNfcIntentFilters = arrayOf(ndefIntentFilter)
-
-        // Init NFC adapter
         mNfcAdapter = NfcAdapter.getDefaultAdapter(this)
         if (mNfcAdapter == null) {
             Toast.makeText(this, "NFC is not available on this device.", Toast.LENGTH_LONG).show()
+        } else {
+            Log.i(TAG, "NFC adapter initialized")
         }
-
-        // Start NFC check loop in case adapter dies
-        startNfcCheckLoop()
-    }
-    override fun onPause() {
-        super.onPause()
-        this.stopNfcCheckLoop()
-        this.disableForegroundDispatch()
     }
 
     override fun onResume() {
         super.onResume()
-        this.startNfcCheckLoop()
-        this.enableForegroundDispatch()
+        enableReaderMode()
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        Log.i("New intent", "New Intent: $intent")
-        Log.v("Intent.action", intent.action ?: "no action")
+    override fun onPause() {
+        super.onPause()
+        disableReaderMode()
+    }
+
+    private fun enableReaderMode() {
+        val adapter = mNfcAdapter ?: return
+        val options = Bundle().apply {
+            putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, PRESENCE_CHECK_DELAY_MS)
+        }
+        adapter.enableReaderMode(this, this, READER_FLAGS, options)
+        Log.i(TAG, "Reader mode enabled: NFC_A + SKIP_NDEF + NO_SOUNDS, presenceCheckDelay=${PRESENCE_CHECK_DELAY_MS}ms")
+    }
+
+    private fun disableReaderMode() {
+        mNfcAdapter?.disableReaderMode(this)
+        Log.i(TAG, "Reader mode disabled")
+    }
+
+    override fun onTagDiscovered(tag: Tag) {
+        Log.i(TAG, "onTagDiscovered: tag=$tag, tech=[${tag.techList.joinToString()}]")
+
+        val bitmap = this.mBitmap
+        if (bitmap == null) {
+            Log.e(TAG, "No bitmap to flash!")
+            runOnUiThread {
+                Toast.makeText(this, "No image to flash!", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
 
         val preferences = Preferences(this)
         val screenSizeEnum = preferences.getScreenSizeEnum()
-
-        if (intent.action == NfcAdapter.ACTION_NDEF_DISCOVERED || intent.action == NfcAdapter.ACTION_TAG_DISCOVERED || intent.action == NfcAdapter.ACTION_TECH_DISCOVERED) {
-            val detectedTag: Tag = intent.getParcelableExtra(NfcAdapter.EXTRA_TAG)!!
-            val tagId = String(detectedTag.id, StandardCharsets.US_ASCII)
-            val tagTechList = detectedTag.techList
-
-            // Do we still have a bitmap to flash?
-            val bitmap = this.mBitmap
-            if (bitmap == null) {
-                Log.v("Missing bitmap", "mBitmap = null")
-                return
+        val requiredTechnology = if (screenSizeEnum == 8) IsoDep::class.java.name else NfcA::class.java.name
+        if (!tag.techList.contains(requiredTechnology)) {
+            Log.e(TAG, "Tag doesn't support $requiredTechnology")
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    "Tag lacks ${requiredTechnology.substringAfterLast('.')}: ${tag.techList.joinToString()}",
+                    Toast.LENGTH_LONG
+                ).show()
             }
-
-            // Check for correct NFC type support
-            if (tagTechList[0] != "android.nfc.tech.NfcA") {
-                Log.v("Invalid tag type. Found:", tagTechList.toString())
-                return
-            }
-
-            // Do an explicit check for the ID. You may need to add the correct ID for your tag model.
-            if (tagId !in WaveShareUIDs) {
-                Log.v("Invalid tag ID", "$tagId not in " + WaveShareUIDs.joinToString(", "))
-                // Currently, this ID is sometimes coming back corrupted, so it is a unreliable check
-                // only enforce check if type != ndef, because in those cases we can't check AAR
-                if (intent.action != NfcAdapter.ACTION_NDEF_DISCOVERED) {
-                    return
-                }
-            }
-
-            // ACTION_NDEF_DISCOVERED has the filter applied for the AAR record *type*,
-            // but the filter for the payload (dataPath / pathPattern) is not working, so as
-            // an extra check, AAR payload will be manually checked, as well as ID
-            if (intent.action == NfcAdapter.ACTION_NDEF_DISCOVERED) {
-                var aarFound = false
-                val rawMsgs = intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES)
-                if (rawMsgs != null) {
-                    for (msg in rawMsgs) {
-                        val ndefMessage: NdefMessage = msg as NdefMessage
-                        val records = ndefMessage.records
-                        for (record in records) {
-                            val payloadStr = String(record.payload)
-                            if (!aarFound) aarFound = payloadStr == "waveshare.feng.nfctag"
-                            if (aarFound) break
-                        }
-                        if (aarFound) break
-                    }
-                }
-
-                if (!aarFound) {
-                    Log.v("Bad NDEFs:", "records found, but missing AAR")
-                }
-            }
-
-            if (!mIsFlashing) {
-                // Here we go!!!
-                Log.v("Matched!", "Tag is a match! Preparing to flash...")
-                lifecycleScope.launch {
-                    flashBitmap(detectedTag, bitmap, screenSizeEnum)
-                }
-            } else {
-                Log.v("Not flashing", "Flashing already in progress!")
-            }
+            return
         }
+
+        if (!mIsFlashing.compareAndSet(false, true)) {
+            Log.w(TAG, "Already flashing, ignoring tag")
+            return
+        }
+        updateFlashingUi(true)
+        flashBitmap(tag, bitmap, screenSizeEnum)
     }
 
-    private suspend fun flashBitmap(tag: Tag, bitmap: Bitmap, screenSizeEnum: Int) {
-        this.mIsFlashing = true
-        // val waveShareHandler = WaveShareHandler(this)
-        val a = a() // Create a new instance.
-        val nfcObj = NfcA.get(tag)
-        a.a(nfcObj) // Init
-        // Override WaveShare's SDK default of 700
-        nfcObj.timeout = 1200
+    private fun flashBitmap(tag: Tag, bitmap: Bitmap, screenSizeEnum: Int) {
         var errorString = ""
 
-        val t: Thread = object : Thread() {
-            //Create an new thread
-            override fun run() {
-                var success = false
-                val tntag: NfcA //NFC tag
-                val thread = Thread(Runnable
-                //Create thread
-                {
-                    var EPD_total_progress = 0
-                    while (EPD_total_progress != -1) {
-                        EPD_total_progress = a.c //Read the progress
-                        runOnUiThread(Runnable {
-                            updateProgressBar(EPD_total_progress)
-                        })
-                        if (EPD_total_progress == 100) {
-                            break
+        Thread({
+            var success = false
+
+            Log.i(TAG, "flashBitmap: screenSizeEnum=$screenSizeEnum, bitmap=${bitmap.width}x${bitmap.height}, tech=[${tag.techList.joinToString()}]")
+
+            try {
+                if (screenSizeEnum == 8) {
+                    Log.i(TAG, "Using native 1.54\" B/W/R ISO-DEP protocol")
+                    val protocol = WaveShare154BProtocol(tag) { progress ->
+                        runOnUiThread { updateProgressBar(progress) }
+                    }
+                    success = protocol.flash(bitmap)
+                    if (!success) {
+                        errorString = "Native 1.54B protocol failed - see WS154B logcat"
+                    }
+                } else {
+                    val nfcTag = NfcA.get(tag)
+                    Log.i(TAG, "Using WaveShare SDK for non-1.54B screen")
+                    nfcTag.connect()
+                    nfcTag.timeout = 5000
+                    
+                        val sdk = a()
+                        val connectionResult = sdk.a(nfcTag)
+                        if (connectionResult != 1) {
+                            errorString = "Failed to connect to NFC tag"
+                            return@Thread
                         }
-                        SystemClock.sleep(10)
-                    }
-                })
-                thread.start() //start the thread
-                tntag = NfcA.get(tag) //Get the tag instance.
-                try {
-                    val whether_succeed: Int = a.a(screenSizeEnum, bitmap) //Send picture
-                    if (whether_succeed == 1) {
-                        success = true
-                    }
-                } catch (e: IOException) {
-                    errorString = e.toString()
-                } finally {
+
                         try {
-                            // Need to run toast on main thread...
-                            runOnUiThread(Runnable {
-                                var toast: Toast? = null
-                                if (!success) {
-                                    toast = Toast.makeText(
-                                        applicationContext,
-                                        "FAILED to Flash :( $errorString",
-                                        Toast.LENGTH_LONG
-                                    )
-                                } else {
-                                    toast = Toast.makeText(
-                                        applicationContext,
-                                        "Success! Flashed display!",
-                                        Toast.LENGTH_LONG
-                                    )
-                                }
-                                toast?.show()
-                            })
-                            Log.v("Final success val", "Success = $success")
-                            tntag.close()
-                        } catch (e: IOException) { //handle exception error
-                            e.printStackTrace()
-                            Log.v("Flashing failed", "See trace above")
+                            val nfcAField = sdk.javaClass.getDeclaredField("k")
+                            nfcAField.isAccessible = true
+                            val sdkNfcA = nfcAField.get(sdk) as? NfcA
+                            sdkNfcA?.timeout = 5000
+                            Log.i(TAG, "Set SDK internal NfcA timeout to 5000ms")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Could not set SDK timeout via reflection: ${e.message}")
                         }
-                        Log.v("Tag closed", "Setting flash in progress = false")
-                        runOnUiThread(Runnable {
-                            mIsFlashing = false
-                        })
+
+                        val stopPolling = AtomicBoolean(false)
+                        val progressThread = Thread({
+                            try {
+                                var progress = 0
+                                while (!stopPolling.get() && progress != -1 && progress < 100) {
+                                    progress = sdk.c
+                                    runOnUiThread { updateProgressBar(progress) }
+                                    SystemClock.sleep(50)
+                                }
+                            } catch (error: Exception) {
+                                if (!stopPolling.get()) {
+                                    Log.w(TAG, "Progress polling failed", error)
+                                }
+                            }
+                        }, "nfc-progress")
+                        progressThread.start()
+
+                        try {
+                            val result = sdk.a(screenSizeEnum, bitmap)
+                            if (result == 1) {
+                                success = true
+                            } else if (result == 2) {
+                                errorString = "Incorrect image resolution"
+                            } else {
+                                errorString = "Flash failed (code: $result)"
+                            }
+                        } finally {
+                            stopPolling.set(true)
+                            progressThread.interrupt()
+                            try {
+                                progressThread.join(200)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                            try {
+                                nfcTag.close()
+                            } catch (error: IOException) {
+                                Log.e(TAG, "Error closing tag", error)
+                            }
+                        }
                 }
+            } catch (error: Exception) {
+                errorString = error.toString()
+                Log.e(TAG, "Flash error", error)
+            } finally {
+                mIsFlashing.set(false)
+                updateFlashingUi(false)
+                runOnUiThread {
+                    val message = if (success) "Success! Flashed display!" else "FAILED to Flash :( $errorString"
+                    Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
+                }
+                Log.i(TAG, "Flash complete. Success = $success")
             }
-        }
-        t.start() //Start thread
+        }, "nfc-flash").start()
     }
 
-    private fun enableForegroundDispatch() {
-        this.mNfcAdapter?.enableForegroundDispatch(this, this.mPendingIntent, this.mNfcIntentFilters, this.mNfcTechList )
-    }
-
-    private fun disableForegroundDispatch() {
-        this.mNfcAdapter?.disableForegroundDispatch(this)
-    }
-
-    private fun startNfcCheckLoop() {
-        if (mNfcCheckHandler == null) {
-            Log.v("NFC Check Loop", "START")
-            mNfcCheckHandler = Handler(Looper.getMainLooper())
-            mNfcCheckHandler?.postDelayed(mNfcCheckCallback, mNfcCheckIntervalMs)
-        }
-    }
-
-    private fun stopNfcCheckLoop() {
-        if (mNfcCheckHandler != null) {
-            mNfcCheckHandler?.removeCallbacks(mNfcCheckCallback)
-        }
-        mNfcCheckHandler = null
-    }
-
-    private fun checkNfcAndAttemptRecover() {
-        if (mNfcAdapter != null) {
-            var isEnabled = false
-            // Apparently querying the property can cause it to get updated
-            // https://stackoverflow.com/a/55691449/11447682
-            try {
-                isEnabled = mNfcAdapter?.isEnabled ?: false
-                if (!isEnabled) {
-                    Log.v("NFC Check #1", "NFC is disabled. Checking again.")
-                }
-            } catch (_: Exception) {}
-            try {
-                isEnabled = mNfcAdapter?.isEnabled ?: false
-                if (!isEnabled) {
-                    Log.v("NFC Check #2", "NFC is disabled.")
-                }
-            } catch (_: Exception) {}
-            if (isEnabled) {
-                enableForegroundDispatch()
-            } else {
-                Log.w("NFC Check", "NFC is disabled - could be waiting on a system recovery")
-            }
-        } else {
-            Log.e("NFC Check", "Adapter is completely unavailable!")
+    private fun updateFlashingUi(isFlashing: Boolean) {
+        runOnUiThread {
+            mWhileFlashingArea?.visibility = if (isFlashing) android.view.View.VISIBLE else android.view.View.GONE
+            mWhileFlashingArea?.requestLayout()
+            mProgressBar?.progress = 0
         }
     }
 
